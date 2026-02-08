@@ -6,5 +6,11 @@
     "bindings": [
       { "name": "ROOM", "class_name": "GomokuRoom" }
     ]
-  }
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["GomokuRoom"]
+    }
+  ]
 }
