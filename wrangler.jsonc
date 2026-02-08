@@ -1,16 +1,15 @@
 {
-  "name": "works",
+  "name": "gomoku-ws",
   "compatibility_date": "2026-02-08",
   "main": "src/index.js",
   "durable_objects": {
     "bindings": [
-      { "name": "ROOM", "class_name": "GomokuRoom" }
+      { "name": "ROOM", "class_name": "GomokuRoom" },
+      { "name": "RELAY", "class_name": "RelayRoom" }
     ]
   },
   "migrations": [
-    {
-      "tag": "v1",
-      "new_sqlite_classes": ["GomokuRoom"]
-    }
+    { "tag": "v1", "new_sqlite_classes": ["GomokuRoom"] },
+    { "tag": "v2", "new_sqlite_classes": ["RelayRoom"] }
   ]
 }
