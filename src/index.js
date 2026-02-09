@@ -39,6 +39,7 @@ export default {
 const SIZE = 19;
 const GOMOKU_BLACK = 1, GOMOKU_WHITE = 2;
 const GM_GRACE_MS = 3 * 60 * 1000; // 断线重连保座位时间（3分钟）
+const GM_ROOM_TTL_MS = 2 * 60 * 60 * 1000; // 房间无活动自动清理（2小时，可按需调整）
 
 export class GomokuRoom {
   constructor(state, env) {
@@ -58,6 +59,7 @@ export class GomokuRoom {
 
     let room = (await this.state.storage.get("gm_room")) || this._defaultRoom();
     const now = Date.now();
+    room.lastActive = now;
 
     const tokenParam = (url.searchParams.get("token") || "").trim();
     const want = (url.searchParams.get("want") || "auto").trim().toLowerCase();
@@ -111,6 +113,7 @@ export class GomokuRoom {
     }
 
     await this.state.storage.put("gm_room", room);
+    await this._bumpAlarmGM(room);
 
     // 给 ws 绑 metadata（用于 message/close）
     if (server.serializeAttachment) server.serializeAttachment({ game: "gomoku", token });
@@ -149,6 +152,7 @@ export class GomokuRoom {
 
     let room = (await this.state.storage.get("gm_room")) || this._defaultRoom();
     const now = Date.now();
+    room.lastActive = now;
 
     const role = this._roleFromToken(att.token, room); // ✅ 关键：始终“以 token 映射角色”为准
     const isPlayer = (role === GOMOKU_BLACK || role === GOMOKU_WHITE);
@@ -182,12 +186,14 @@ export class GomokuRoom {
         room.winner = role;
         room.reason = "五连";
         await this.state.storage.put("gm_room", room);
+    await this._bumpAlarmGM(room);
         this._broadcast({ type: "move", r, c, p: role, win: role });
         return;
       }
 
       room.current = (role === GOMOKU_BLACK) ? GOMOKU_WHITE : GOMOKU_BLACK;
       await this.state.storage.put("gm_room", room);
+    await this._bumpAlarmGM(room);
       this._broadcast({ type: "move", r, c, p: role, next: room.current });
       return;
     }
@@ -202,6 +208,7 @@ export class GomokuRoom {
       room.winner = (role === GOMOKU_BLACK) ? GOMOKU_WHITE : GOMOKU_BLACK;
       room.reason = "超时判负";
       await this.state.storage.put("gm_room", room);
+    await this._bumpAlarmGM(room);
       this._broadcast({ type: "move", r: -1, c: -1, p: role, win: room.winner, reason: room.reason });
       return;
     }
@@ -213,6 +220,7 @@ export class GomokuRoom {
 
       room.rematch[role] = true;
       await this.state.storage.put("gm_room", room);
+    await this._bumpAlarmGM(room);
 
       // 通知对方/观战
       this._broadcast({ type: "rematch_pending" });
@@ -227,6 +235,7 @@ export class GomokuRoom {
         room.rematch = { [GOMOKU_BLACK]: false, [GOMOKU_WHITE]: false };
         room.swap = { [GOMOKU_BLACK]: false, [GOMOKU_WHITE]: false };
         await this.state.storage.put("gm_room", room);
+    await this._bumpAlarmGM(room);
 
         this._broadcast({ type: "state", moves: [], current: room.current, gameOver: false });
         this._broadcast({ type: "votes", votes: { rematch: room.rematch, swap: room.swap } });
@@ -241,6 +250,7 @@ export class GomokuRoom {
 
       room.swap[role] = true;
       await this.state.storage.put("gm_room", room);
+    await this._bumpAlarmGM(room);
 
       this._broadcast({ type: "swap_pending" });
       this._broadcast({ type: "votes", votes: { rematch: room.rematch, swap: room.swap } });
@@ -265,6 +275,7 @@ export class GomokuRoom {
         room.swap = { [GOMOKU_BLACK]: false, [GOMOKU_WHITE]: false };
 
         await this.state.storage.put("gm_room", room);
+    await this._bumpAlarmGM(room);
 
         // 广播座位变化
         this._broadcastSeats(room);
@@ -296,6 +307,7 @@ export class GomokuRoom {
         room.whiteLastSeen = 0;
       }
       await this.state.storage.put("gm_room", room);
+    await this._bumpAlarmGM(room);
       this._broadcastSeats(room);
       this._broadcastPresence();
       return;
@@ -308,16 +320,49 @@ export class GomokuRoom {
 
     if (att?.game === "gomoku") {
       const now = Date.now();
-      room.lastActive = now;
       let room = (await this.state.storage.get("gm_room")) || this._defaultRoom();
+      room.lastActive = now;
       const role = this._roleFromToken(att.token, room);
       if (role === GOMOKU_BLACK) room.blackLastSeen = now;
       if (role === GOMOKU_WHITE) room.whiteLastSeen = now;
       await this.state.storage.put("gm_room", room);
+    await this._bumpAlarmGM(room);
       this._broadcastSeats(room);
     }
 
     this._broadcastPresence();
+  }
+
+
+  // ===== 房间清理（避免无活动房间长期残留）=====
+  async _bumpAlarmGM(room) {
+    const base = Number(room?.lastActive || Date.now());
+    try { await this.state.storage.setAlarm(base + GM_ROOM_TTL_MS); } catch {}
+  }
+
+  async alarm() {
+    try {
+      const now = Date.now();
+      const room = await this.state.storage.get("gm_room");
+      if (!room) return;
+
+      // 仍有连接：继续延期（不删除）
+      const sockets = this.state.getWebSockets();
+      if (sockets && sockets.length > 0) {
+        try { await this.state.storage.setAlarm(now + GM_ROOM_TTL_MS); } catch {}
+        return;
+      }
+
+      const last = Number(room.lastActive || room.blackLastSeen || room.whiteLastSeen || 0);
+      if (last && (now - last) >= GM_ROOM_TTL_MS) {
+        await this.state.storage.delete("gm_room");
+        try { await this.state.storage.deleteAlarm(); } catch {}
+        return;
+      }
+
+      // lastActive 缺失或未到期：重新安排一次
+      try { await this.state.storage.setAlarm((last || now) + GM_ROOM_TTL_MS); } catch {}
+    } catch {}
   }
 
   // ===== helpers =====
@@ -327,6 +372,7 @@ export class GomokuRoom {
       whiteToken: "",
       blackLastSeen: 0,
       whiteLastSeen: 0,
+      lastActive: 0,
       moves: [],
       current: GOMOKU_BLACK,
       gameOver: false,
@@ -409,6 +455,7 @@ function checkWin(moves, r, c, p) {
 const XQ_RED = 1;
 const XQ_BLACK = 2;
 const XQ_GRACE_MS = 3 * 60 * 1000; // 断线重连保座位时间（3分钟）
+const XQ_ROOM_TTL_MS = 2 * 60 * 60 * 1000; // 房间无活动自动清理（2小时，可按需调整）
 
 export class RelayRoom {
   constructor(state, env) {
@@ -446,6 +493,7 @@ export class RelayRoom {
 
     let room = (await this.state.storage.get("xq_room")) || this._xqDefaultRoom();
     const now = Date.now();
+    room.lastActive = now;
 
     const tokenParam = (url.searchParams.get("token") || "").trim();
     const want = (url.searchParams.get("want") || "auto").trim().toLowerCase();
@@ -564,11 +612,41 @@ export class RelayRoom {
       if (att.role === XQ_RED) room.redLastSeen = now;
       if (att.role === XQ_BLACK) room.blackLastSeen = now;
       await this.state.storage.put("xq_room", room);
-      await this._bumpAlarmXQ(room);
+    await this._bumpAlarmXQ(room);
       this._broadcastXqSeats(room);
     }
 
     this._broadcastPresence();
+  }
+
+
+  // ===== 房间清理（避免无活动房间长期残留）=====
+  async _bumpAlarmXQ(room) {
+    const base = Number(room?.lastActive || Date.now());
+    try { await this.state.storage.setAlarm(base + XQ_ROOM_TTL_MS); } catch {}
+  }
+
+  async alarm() {
+    try {
+      const now = Date.now();
+      const room = await this.state.storage.get("xq_room");
+      if (!room) return;
+
+      const sockets = this.state.getWebSockets();
+      if (sockets && sockets.length > 0) {
+        try { await this.state.storage.setAlarm(now + XQ_ROOM_TTL_MS); } catch {}
+        return;
+      }
+
+      const last = Number(room.lastActive || room.redLastSeen || room.blackLastSeen || 0);
+      if (last && (now - last) >= XQ_ROOM_TTL_MS) {
+        await this.state.storage.delete("xq_room");
+        try { await this.state.storage.deleteAlarm(); } catch {}
+        return;
+      }
+
+      try { await this.state.storage.setAlarm((last || now) + XQ_ROOM_TTL_MS); } catch {}
+    } catch {}
   }
 
   // ===== broadcast =====
@@ -617,25 +695,9 @@ export class RelayRoom {
     };
   }
 
-  async _bumpAlarmXQ(room) {
-    // 以最后活动时间为准设置 alarm；避免房间长期残留
-    let base = Number(room?.lastActive || 0);
-    if (!base) {
-      try {
-        const r = (await this.state.storage.get("xq_room")) || null;
-        base = Number(r?.lastActive || Date.now());
-      } catch {
-        base = Date.now();
-      }
-    }
-    const t = base + XQ_ROOM_TTL_MS;
-    try { await this.state.storage.setAlarm(t); } catch {}
-  }
-
   async _handleXqMessage(ws, att, msg) {
     let room = (await this.state.storage.get("xq_room")) || this._xqDefaultRoom();
-    const now = Date.now();
-    room.lastActive = now;
+    room.lastActive = Date.now();
     const role = att.role | 0;
     const isPlayer = (role === XQ_RED || role === XQ_BLACK);
 
@@ -709,7 +771,7 @@ export class RelayRoom {
       if (role === XQ_BLACK) room.blackLastSeen = now;
 
       await this.state.storage.put("xq_room", room);
-      await this._bumpAlarmXQ(room);
+    await this._bumpAlarmXQ(room);
 
       this._broadcast({
         type: "xq_move",
@@ -736,7 +798,7 @@ export class RelayRoom {
       room.winner = role === XQ_RED ? XQ_BLACK : XQ_RED;
       room.reason = "超时判负";
       await this.state.storage.put("xq_room", room);
-      await this._bumpAlarmXQ(room);
+    await this._bumpAlarmXQ(room);
       this._broadcast({ type: "xq_over", winner: room.winner, reason: room.reason });
       return;
     }
@@ -748,7 +810,7 @@ export class RelayRoom {
 
       room.rematch[role] = true;
       await this.state.storage.put("xq_room", room);
-      await this._bumpAlarmXQ(room);
+    await this._bumpAlarmXQ(room);
       this._broadcast({ type: "xq_votes", votes: { rematch: room.rematch, swap: room.swap } });
 
       if (room.rematch[XQ_RED] && room.rematch[XQ_BLACK] && room.redToken && room.blackToken) {
@@ -760,7 +822,7 @@ export class RelayRoom {
         room.rematch = { [XQ_RED]: false, [XQ_BLACK]: false };
         room.swap = { [XQ_RED]: false, [XQ_BLACK]: false };
         await this.state.storage.put("xq_room", room);
-        await this._bumpAlarmXQ(room);
+    await this._bumpAlarmXQ(room);
 
         this._broadcast({ type: "xq_reset", reason: "rematch", current: room.current, moves: [] });
         this._broadcast({ type: "xq_votes", votes: { rematch: room.rematch, swap: room.swap } });
@@ -775,7 +837,7 @@ export class RelayRoom {
 
       room.swap[role] = true;
       await this.state.storage.put("xq_room", room);
-      await this._bumpAlarmXQ(room);
+    await this._bumpAlarmXQ(room);
       this._broadcast({ type: "xq_votes", votes: { rematch: room.rematch, swap: room.swap } });
 
       if (room.swap[XQ_RED] && room.swap[XQ_BLACK] && room.redToken && room.blackToken) {
@@ -798,7 +860,7 @@ export class RelayRoom {
         room.swap = { [XQ_RED]: false, [XQ_BLACK]: false };
 
         await this.state.storage.put("xq_room", room);
-        await this._bumpAlarmXQ(room);
+    await this._bumpAlarmXQ(room);
 
         this._broadcastXqSeats(room);
         this._broadcast({ type: "xq_reset", reason: "swap", current: room.current, moves: [] });
@@ -824,7 +886,7 @@ export class RelayRoom {
         room.blackLastSeen = 0;
       }
       await this.state.storage.put("xq_room", room);
-      await this._bumpAlarmXQ(room);
+    await this._bumpAlarmXQ(room);
       this._broadcastXqSeats(room);
       this._broadcastPresence();
       return;
