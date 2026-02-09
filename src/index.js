@@ -308,6 +308,7 @@ export class GomokuRoom {
 
     if (att?.game === "gomoku") {
       const now = Date.now();
+      room.lastActive = now;
       let room = (await this.state.storage.get("gm_room")) || this._defaultRoom();
       const role = this._roleFromToken(att.token, room);
       if (role === GOMOKU_BLACK) room.blackLastSeen = now;
@@ -497,6 +498,7 @@ export class RelayRoom {
     }
 
     await this.state.storage.put("xq_room", room);
+    await this._bumpAlarmXQ(room);
 
     if (server.serializeAttachment) server.serializeAttachment({ game: "xq", role: youRole, token });
 
@@ -558,9 +560,11 @@ export class RelayRoom {
     if (att?.game === "xq") {
       const now = Date.now();
       let room = (await this.state.storage.get("xq_room")) || this._xqDefaultRoom();
+      room.lastActive = now;
       if (att.role === XQ_RED) room.redLastSeen = now;
       if (att.role === XQ_BLACK) room.blackLastSeen = now;
       await this.state.storage.put("xq_room", room);
+      await this._bumpAlarmXQ(room);
       this._broadcastXqSeats(room);
     }
 
@@ -602,6 +606,7 @@ export class RelayRoom {
       blackToken: "",
       redLastSeen: 0,
       blackLastSeen: 0,
+      lastActive: 0,
       moves: [],          // [{from:{r,c}, to:{r,c}, p:1|2}]
       current: XQ_RED,    // 轮到谁走：1红 2黑
       gameOver: false,
@@ -612,8 +617,25 @@ export class RelayRoom {
     };
   }
 
+  async _bumpAlarmXQ(room) {
+    // 以最后活动时间为准设置 alarm；避免房间长期残留
+    let base = Number(room?.lastActive || 0);
+    if (!base) {
+      try {
+        const r = (await this.state.storage.get("xq_room")) || null;
+        base = Number(r?.lastActive || Date.now());
+      } catch {
+        base = Date.now();
+      }
+    }
+    const t = base + XQ_ROOM_TTL_MS;
+    try { await this.state.storage.setAlarm(t); } catch {}
+  }
+
   async _handleXqMessage(ws, att, msg) {
     let room = (await this.state.storage.get("xq_room")) || this._xqDefaultRoom();
+    const now = Date.now();
+    room.lastActive = now;
     const role = att.role | 0;
     const isPlayer = (role === XQ_RED || role === XQ_BLACK);
 
@@ -687,6 +709,7 @@ export class RelayRoom {
       if (role === XQ_BLACK) room.blackLastSeen = now;
 
       await this.state.storage.put("xq_room", room);
+      await this._bumpAlarmXQ(room);
 
       this._broadcast({
         type: "xq_move",
@@ -713,6 +736,7 @@ export class RelayRoom {
       room.winner = role === XQ_RED ? XQ_BLACK : XQ_RED;
       room.reason = "超时判负";
       await this.state.storage.put("xq_room", room);
+      await this._bumpAlarmXQ(room);
       this._broadcast({ type: "xq_over", winner: room.winner, reason: room.reason });
       return;
     }
@@ -724,6 +748,7 @@ export class RelayRoom {
 
       room.rematch[role] = true;
       await this.state.storage.put("xq_room", room);
+      await this._bumpAlarmXQ(room);
       this._broadcast({ type: "xq_votes", votes: { rematch: room.rematch, swap: room.swap } });
 
       if (room.rematch[XQ_RED] && room.rematch[XQ_BLACK] && room.redToken && room.blackToken) {
@@ -735,6 +760,7 @@ export class RelayRoom {
         room.rematch = { [XQ_RED]: false, [XQ_BLACK]: false };
         room.swap = { [XQ_RED]: false, [XQ_BLACK]: false };
         await this.state.storage.put("xq_room", room);
+        await this._bumpAlarmXQ(room);
 
         this._broadcast({ type: "xq_reset", reason: "rematch", current: room.current, moves: [] });
         this._broadcast({ type: "xq_votes", votes: { rematch: room.rematch, swap: room.swap } });
@@ -749,6 +775,7 @@ export class RelayRoom {
 
       room.swap[role] = true;
       await this.state.storage.put("xq_room", room);
+      await this._bumpAlarmXQ(room);
       this._broadcast({ type: "xq_votes", votes: { rematch: room.rematch, swap: room.swap } });
 
       if (room.swap[XQ_RED] && room.swap[XQ_BLACK] && room.redToken && room.blackToken) {
@@ -771,6 +798,7 @@ export class RelayRoom {
         room.swap = { [XQ_RED]: false, [XQ_BLACK]: false };
 
         await this.state.storage.put("xq_room", room);
+        await this._bumpAlarmXQ(room);
 
         this._broadcastXqSeats(room);
         this._broadcast({ type: "xq_reset", reason: "swap", current: room.current, moves: [] });
@@ -796,6 +824,7 @@ export class RelayRoom {
         room.blackLastSeen = 0;
       }
       await this.state.storage.put("xq_room", room);
+      await this._bumpAlarmXQ(room);
       this._broadcastXqSeats(room);
       this._broadcastPresence();
       return;
