@@ -1,5 +1,5 @@
 {
-  "name": "gomoku-ws",
+  "name": "wokers",
   "compatibility_date": "2026-02-08",
   "main": "src/index.js",
   "durable_objects": {
