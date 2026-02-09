@@ -1,4 +1,3 @@
-
 // Cloudflare Worker (module syntax)
 // - /ws         : 五子棋权威房间（判胜/校验回合）
 // - /relay      : 默认纯转发
@@ -35,10 +34,11 @@ export default {
 };
 
 // ========================
-// 五子棋房间（权威）
+// 五子棋房间（权威 · 座位制 · 断线重连 · 换边/再来一局）
 // ========================
 const SIZE = 19;
 const GOMOKU_BLACK = 1, GOMOKU_WHITE = 2;
+const GM_GRACE_MS = 3 * 60 * 1000; // 断线重连保座位时间（3分钟）
 
 export class GomokuRoom {
   constructor(state, env) {
@@ -47,47 +47,94 @@ export class GomokuRoom {
   }
 
   async fetch(request) {
+    const url = new URL(request.url);
+
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];
 
-    // ✅ WebSocket Hibernation API：只调用 acceptWebSocket，不要 ws.accept / addEventListener
+    // ✅ WebSocket Hibernation API：只调用 acceptWebSocket
     this.state.acceptWebSocket(server);
 
-    let room = (await this.state.storage.get("room")) || {
-      order: [],
-      players: {}, // connId -> {color}
-      moves: [],
-      current: GOMOKU_BLACK,
-      gameOver: false,
-    };
+    let room = (await this.state.storage.get("gm_room")) || this._defaultRoom();
+    const now = Date.now();
 
-    const connId = crypto.randomUUID();
+    const tokenParam = (url.searchParams.get("token") || "").trim();
+    const want = (url.searchParams.get("want") || "auto").trim().toLowerCase();
 
-    // 分配身份：第 1 人黑，第 2 人白，其余观战(0)
-    let color = 0;
-    if (room.order.length === 0) color = GOMOKU_BLACK;
-    else if (room.order.length === 1) color = GOMOKU_WHITE;
+    const onlineCount = this._countOnlineByRoleWithRoom(room);
 
-    room.players[connId] = { color };
-    room.order.push(connId);
+    // 1) token 直接回座
+    let you = 0;
+    let token = tokenParam || "";
+    if (token && token === room.blackToken) you = GOMOKU_BLACK;
+    else if (token && token === room.whiteToken) you = GOMOKU_WHITE;
 
-    await this.state.storage.put("room", room);
+    // 2) token 不匹配：按 want 分配（座位占用则观战）
+    if (you === 0) {
+      const canStealBlack = room.blackToken && (onlineCount[GOMOKU_BLACK] || 0) === 0 && (now - (room.blackLastSeen || 0) > GM_GRACE_MS);
+      const canStealWhite = room.whiteToken && (onlineCount[GOMOKU_WHITE] || 0) === 0 && (now - (room.whiteLastSeen || 0) > GM_GRACE_MS);
 
-    // 给这条 ws 绑 metadata（用于 message/close）
-    if (server.serializeAttachment) server.serializeAttachment({ game: "gomoku", connId });
+      const wantBlack = want === "black" || want === "b" || want === "1";
+      const wantWhite = want === "white" || want === "w" || want === "2";
+      const wantSpectate = want === "spectate" || want === "watch" || want === "0";
+      const wantAuto = want === "auto" || want === "";
+
+      if (!wantSpectate && (wantBlack || wantAuto)) {
+        if (!room.blackToken || canStealBlack) {
+          you = GOMOKU_BLACK;
+          token = crypto.randomUUID();
+          room.blackToken = token;
+          room.blackLastSeen = now;
+        }
+      }
+
+      if (you === 0 && !wantSpectate && (wantWhite || wantAuto)) {
+        if (!room.whiteToken || canStealWhite) {
+          you = GOMOKU_WHITE;
+          token = crypto.randomUUID();
+          room.whiteToken = token;
+          room.whiteLastSeen = now;
+        }
+      }
+    } else {
+      // 续座：刷新 lastSeen
+      if (you === GOMOKU_BLACK) room.blackLastSeen = now;
+      if (you === GOMOKU_WHITE) room.whiteLastSeen = now;
+    }
+
+    // 兜底：有座位但 token 为空
+    if ((you === GOMOKU_BLACK || you === GOMOKU_WHITE) && !token) {
+      token = crypto.randomUUID();
+      if (you === GOMOKU_BLACK) room.blackToken = token;
+      if (you === GOMOKU_WHITE) room.whiteToken = token;
+    }
+
+    await this.state.storage.put("gm_room", room);
+
+    // 给 ws 绑 metadata（用于 message/close）
+    if (server.serializeAttachment) server.serializeAttachment({ game: "gomoku", token });
+
+    // ✅ 同 token（刷新/多开）只保留一条连接，避免人数/座位错乱
+    if (token) this._kickSameToken(server, token);
 
     // 发 init（只给这个连接）
     server.send(JSON.stringify({
       type: "init",
-      you: color,
+      you,
+      token: (you === GOMOKU_BLACK || you === GOMOKU_WHITE) ? token : "",
       moves: room.moves,
       current: room.current,
       gameOver: room.gameOver,
+      winner: room.winner || 0,
+      reason: room.reason || "",
+      seats: { black: !!room.blackToken, white: !!room.whiteToken },
+      votes: { rematch: room.rematch, swap: room.swap },
     }));
 
-    // 广播在线人数
+    // 广播在线人数/座位
     this._broadcastPresence();
+    this._broadcastSeats(room);
 
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -99,60 +146,226 @@ export class GomokuRoom {
 
     let msg;
     try { msg = JSON.parse(message); } catch { return; }
-    if (msg.type !== "move") return;
 
-    let room = (await this.state.storage.get("room")) || {
-      order: [],
-      players: {},
-      moves: [],
-      current: GOMOKU_BLACK,
-      gameOver: false,
+    let room = (await this.state.storage.get("gm_room")) || this._defaultRoom();
+    const now = Date.now();
+
+    const role = this._roleFromToken(att.token, room); // ✅ 关键：始终“以 token 映射角色”为准
+    const isPlayer = (role === GOMOKU_BLACK || role === GOMOKU_WHITE);
+
+    const reject = (reason) => {
+      try { ws.send(JSON.stringify({ type: "reject", reason: String(reason || "操作无效") })); } catch {}
     };
 
-    if (room.gameOver) return;
 
-    const player = room.players[att.connId];
-    if (!player || (player.color !== GOMOKU_BLACK && player.color !== GOMOKU_WHITE)) return;
-    if (player.color !== room.current) return;
+    // ---- 走子 ----
+    if (msg.type === "move") {
+      if (!isPlayer) return reject("观战不能落子");
+      if (room.gameOver) return reject("对局已结束");
+      if (room.current !== role) return reject("还没轮到你");
 
-    const r = msg.r | 0, c = msg.c | 0;
-    if (r < 0 || r >= SIZE || c < 0 || c >= SIZE) return;
-    if (isOccupied(room.moves, r, c)) return;
+      const r = msg.r | 0, c = msg.c | 0;
+      if (r < 0 || r >= SIZE || c < 0 || c >= SIZE) return reject("落子越界");
+      if (isOccupied(room.moves, r, c)) return reject("该点已有棋子");
 
-    room.moves.push({ r, c, p: player.color });
+      room.moves.push({ r, c, p: role });
 
-    if (checkWin(room.moves, r, c, player.color)) {
-      room.gameOver = true;
-      this._broadcast({ type: "move", r, c, p: player.color, win: player.color });
-    } else {
-      room.current = room.current === GOMOKU_BLACK ? GOMOKU_WHITE : GOMOKU_BLACK;
-      this._broadcast({ type: "move", r, c, p: player.color, next: room.current });
+      if (role === GOMOKU_BLACK) room.blackLastSeen = now;
+      if (role === GOMOKU_WHITE) room.whiteLastSeen = now;
+
+      // 清空投票
+      room.rematch = { [GOMOKU_BLACK]: false, [GOMOKU_WHITE]: false };
+      room.swap = { [GOMOKU_BLACK]: false, [GOMOKU_WHITE]: false };
+
+      if (checkWin(room.moves, r, c, role)) {
+        room.gameOver = true;
+        room.winner = role;
+        room.reason = "五连";
+        await this.state.storage.put("gm_room", room);
+        this._broadcast({ type: "move", r, c, p: role, win: role });
+        return;
+      }
+
+      room.current = (role === GOMOKU_BLACK) ? GOMOKU_WHITE : GOMOKU_BLACK;
+      await this.state.storage.put("gm_room", room);
+      this._broadcast({ type: "move", r, c, p: role, next: room.current });
+      return;
     }
 
-    await this.state.storage.put("room", room);
+    // ---- 超时判负（可选：前端若发送）----
+    if (msg.type === "timeout") {
+      if (!isPlayer) return reject("观战不能落子");
+      if (room.gameOver) return reject("对局已结束");
+      if (room.current !== role) return reject("还没轮到你");
+
+      room.gameOver = true;
+      room.winner = (role === GOMOKU_BLACK) ? GOMOKU_WHITE : GOMOKU_BLACK;
+      room.reason = "超时判负";
+      await this.state.storage.put("gm_room", room);
+      this._broadcast({ type: "move", r: -1, c: -1, p: role, win: room.winner, reason: room.reason });
+      return;
+    }
+
+    // ---- 再来一局（双方确认）----
+    if (msg.type === "rematch") {
+      if (!isPlayer) return;
+      if (!room.gameOver) return;
+
+      room.rematch[role] = true;
+      await this.state.storage.put("gm_room", room);
+
+      // 通知对方/观战
+      this._broadcast({ type: "rematch_pending" });
+      this._broadcast({ type: "votes", votes: { rematch: room.rematch, swap: room.swap } });
+
+      if (room.rematch[GOMOKU_BLACK] && room.rematch[GOMOKU_WHITE] && room.blackToken && room.whiteToken) {
+        room.moves = [];
+        room.current = GOMOKU_BLACK;
+        room.gameOver = false;
+        room.winner = 0;
+        room.reason = "";
+        room.rematch = { [GOMOKU_BLACK]: false, [GOMOKU_WHITE]: false };
+        room.swap = { [GOMOKU_BLACK]: false, [GOMOKU_WHITE]: false };
+        await this.state.storage.put("gm_room", room);
+
+        this._broadcast({ type: "state", moves: [], current: room.current, gameOver: false });
+        this._broadcast({ type: "votes", votes: { rematch: room.rematch, swap: room.swap } });
+      }
+      return;
+    }
+
+    // ---- 换边（双方确认；对局进行中不允许换）----
+    if (msg.type === "swap") {
+      if (!isPlayer) return;
+      if (!room.gameOver && room.moves.length > 0) return;
+
+      room.swap[role] = true;
+      await this.state.storage.put("gm_room", room);
+
+      this._broadcast({ type: "swap_pending" });
+      this._broadcast({ type: "votes", votes: { rematch: room.rematch, swap: room.swap } });
+
+      if (room.swap[GOMOKU_BLACK] && room.swap[GOMOKU_WHITE] && room.blackToken && room.whiteToken) {
+        // 交换 token（等价于双方换边）
+        const t = room.blackToken;
+        room.blackToken = room.whiteToken;
+        room.whiteToken = t;
+
+        const ts = room.blackLastSeen;
+        room.blackLastSeen = room.whiteLastSeen;
+        room.whiteLastSeen = ts;
+
+        // 新局
+        room.moves = [];
+        room.current = GOMOKU_BLACK;
+        room.gameOver = false;
+        room.winner = 0;
+        room.reason = "";
+        room.rematch = { [GOMOKU_BLACK]: false, [GOMOKU_WHITE]: false };
+        room.swap = { [GOMOKU_BLACK]: false, [GOMOKU_WHITE]: false };
+
+        await this.state.storage.put("gm_room", room);
+
+        // 广播座位变化
+        this._broadcastSeats(room);
+
+        // ✅ 定向通知每条连接它现在是谁（避免前端“刷新/重连才知道角色”）
+        for (const w of this.state.getWebSockets()) {
+          let a = null;
+          try { a = w.deserializeAttachment ? w.deserializeAttachment() : null; } catch {}
+          if (!a || a.game !== "gomoku") continue;
+          const who = this._roleFromToken(a.token, room);
+          try { w.send(JSON.stringify({ type: "role", you: who })); } catch {}
+        }
+
+        this._broadcast({ type: "state", moves: [], current: room.current, gameOver: false });
+        this._broadcast({ type: "votes", votes: { rematch: room.rematch, swap: room.swap } });
+      }
+      return;
+    }
+
+    // ---- 主动离座（可选：前端如发送）----
+    if (msg.type === "gm_leave") {
+      if (!isPlayer) return;
+      if (role === GOMOKU_BLACK && att.token && att.token === room.blackToken) {
+        room.blackToken = "";
+        room.blackLastSeen = 0;
+      }
+      if (role === GOMOKU_WHITE && att.token && att.token === room.whiteToken) {
+        room.whiteToken = "";
+        room.whiteLastSeen = 0;
+      }
+      await this.state.storage.put("gm_room", room);
+      this._broadcastSeats(room);
+      this._broadcastPresence();
+      return;
+    }
   }
 
   async webSocketClose(ws, code, reason, wasClean) {
     let att = null;
     try { att = ws.deserializeAttachment ? ws.deserializeAttachment() : null; } catch {}
-    if (!att || att.game !== "gomoku") {
-      this._broadcastPresence();
-      return;
+
+    if (att?.game === "gomoku") {
+      const now = Date.now();
+      let room = (await this.state.storage.get("gm_room")) || this._defaultRoom();
+      const role = this._roleFromToken(att.token, room);
+      if (role === GOMOKU_BLACK) room.blackLastSeen = now;
+      if (role === GOMOKU_WHITE) room.whiteLastSeen = now;
+      await this.state.storage.put("gm_room", room);
+      this._broadcastSeats(room);
     }
 
-    let room = (await this.state.storage.get("room")) || {
-      order: [],
-      players: {},
+    this._broadcastPresence();
+  }
+
+  // ===== helpers =====
+  _defaultRoom() {
+    return {
+      blackToken: "",
+      whiteToken: "",
+      blackLastSeen: 0,
+      whiteLastSeen: 0,
       moves: [],
       current: GOMOKU_BLACK,
       gameOver: false,
+      winner: 0,
+      reason: "",
+      rematch: { [GOMOKU_BLACK]: false, [GOMOKU_WHITE]: false },
+      swap: { [GOMOKU_BLACK]: false, [GOMOKU_WHITE]: false },
     };
+  }
 
-    delete room.players[att.connId];
-    room.order = room.order.filter((x) => x !== att.connId);
+  _roleFromToken(token, room) {
+    if (!token) return 0;
+    if (token === room.blackToken) return GOMOKU_BLACK;
+    if (token === room.whiteToken) return GOMOKU_WHITE;
+    return 0;
+  }
 
-    await this.state.storage.put("room", room);
-    this._broadcastPresence();
+  _countOnlineByRoleWithRoom(room) {
+    const cnt = { [GOMOKU_BLACK]: 0, [GOMOKU_WHITE]: 0 };
+    for (const ws of this.state.getWebSockets()) {
+      let a = null;
+      try { a = ws.deserializeAttachment ? ws.deserializeAttachment() : null; } catch {}
+      if (a?.game === "gomoku") {
+        const role = this._roleFromToken(a.token, room);
+        if (role === GOMOKU_BLACK || role === GOMOKU_WHITE) cnt[role] = (cnt[role] || 0) + 1;
+      }
+    }
+    return cnt;
+  }
+
+  _kickSameToken(currentWs, token) {
+    if (!token) return;
+    for (const ws of this.state.getWebSockets()) {
+      if (ws === currentWs) continue;
+      let a = null;
+      try { a = ws.deserializeAttachment ? ws.deserializeAttachment() : null; } catch {}
+      if (a?.game === "gomoku" && a.token && a.token === token) {
+        try { ws.close(1000, "reconnect"); } catch {}
+      }
+    }
   }
 
   _broadcast(payload) {
@@ -166,14 +379,18 @@ export class GomokuRoom {
     const n = this.state.getWebSockets().length;
     this._broadcast({ type: "presence", n });
   }
+
+  _broadcastSeats(room) {
+    this._broadcast({ type: "gm_seats", seats: { black: !!room.blackToken, white: !!room.whiteToken } });
+  }
 }
 
 function isOccupied(moves, r, c) {
-  return moves.some((m) => m.r === r && m.c === c);
+  return (moves || []).some((m) => m.r === r && m.c === c);
 }
 
 function checkWin(moves, r, c, p) {
-  const s = new Set(moves.filter((m) => m.p === p).map((m) => `${m.r}#${m.c}`));
+  const s = new Set((moves || []).filter((m) => m.p === p).map((m) => `${m.r}#${m.c}`));
   const dirs = [[1,0],[0,1],[1,1],[1,-1]];
   for (const [dr, dc] of dirs) {
     let cnt = 1;
@@ -283,6 +500,18 @@ export class RelayRoom {
 
     if (server.serializeAttachment) server.serializeAttachment({ game: "xq", role: youRole, token });
 
+    // ✅ 同 token（刷新/多开）只保留一条连接，避免人数/座位错乱
+    if (token) {
+      for (const w of this.state.getWebSockets()) {
+        if (w === server) continue;
+        let a = null;
+        try { a = w.deserializeAttachment ? w.deserializeAttachment() : null; } catch {}
+        if (a?.game === "xq" && a.token && a.token === token) {
+          try { w.close(1000, "reconnect"); } catch {}
+        }
+      }
+    }
+
     server.send(JSON.stringify({
       type: "init",
       you: youRole,
@@ -317,7 +546,7 @@ export class RelayRoom {
     }
 
     if (att.game === "xq") {
-      await this._handleXqMessage(att, msg);
+      await this._handleXqMessage(ws, att, msg);
       return;
     }
   }
@@ -383,30 +612,49 @@ export class RelayRoom {
     };
   }
 
-  async _handleXqMessage(att, msg) {
+  async _handleXqMessage(ws, att, msg) {
     let room = (await this.state.storage.get("xq_room")) || this._xqDefaultRoom();
     const role = att.role | 0;
     const isPlayer = (role === XQ_RED || role === XQ_BLACK);
 
+    const reject = (reason, sync=false) => {
+      try { ws.send(JSON.stringify({ type: "reject", reason: String(reason || "操作无效") })); } catch {}
+      if (sync) {
+        try {
+          ws.send(JSON.stringify({
+            type: "init",
+            you: role,
+            token: (att.token && isPlayer) ? String(att.token) : "",
+            moves: room.moves,
+            current: room.current,
+            gameOver: room.gameOver,
+            winner: room.winner || 0,
+            reason: room.reason || "",
+            seats: { red: !!room.redToken, black: !!room.blackToken },
+            votes: { rematch: room.rematch, swap: room.swap },
+          }));
+        } catch {}
+      }
+    };
+
     // ---- 走子 ----
     if (msg.type === "xq_move") {
-      if (!isPlayer) return;
-      if (room.gameOver) return;
-      if (!room.redToken || !room.blackToken) return; // 必须双方都在位才开走
-      if (room.current !== role) return;
+      if (!isPlayer) return reject("观战不能落子");
+      if (room.gameOver) return reject("对局已结束");
+      if (room.current !== role) return reject("还没轮到你");
 
       const from = msg.from || {};
       const to = msg.to || {};
       const fr = from.r | 0, fc = from.c | 0, tr = to.r | 0, tc = to.c | 0;
-      if (fr < 0 || fr >= 10 || fc < 0 || fc >= 9) return;
-      if (tr < 0 || tr >= 10 || tc < 0 || tc >= 9) return;
+      if (fr < 0 || fr >= 10 || fc < 0 || fc >= 9) return reject("起点越界");
+      if (tr < 0 || tr >= 10 || tc < 0 || tc >= 9) return reject("终点越界");
 
       const game = buildXqEngineFromMoves(room.moves);
       const color = role === XQ_RED ? 1 : -1;
-      if (game.turn !== color) return;
+      if (game.turn !== color) return reject("状态不同步（回合不一致）", true);
 
       const legal = game.findLegalMove(fr, fc, tr, tc);
-      if (!legal) return;
+      if (!legal) return reject("非法走法", true);
 
       game.applyMove(legal);
       room.moves.push({ from: { r: fr, c: fc }, to: { r: tr, c: tc }, p: role });
@@ -457,9 +705,9 @@ export class RelayRoom {
 
     // ---- 超时判负 ----
     if (msg.type === "xq_timeout") {
-      if (!isPlayer) return;
-      if (room.gameOver) return;
-      if (room.current !== role) return;
+      if (!isPlayer) return reject("观战不能落子");
+      if (room.gameOver) return reject("对局已结束");
+      if (room.current !== role) return reject("还没轮到你");
 
       room.gameOver = true;
       room.winner = role === XQ_RED ? XQ_BLACK : XQ_RED;
